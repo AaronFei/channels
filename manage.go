@@ -6,14 +6,14 @@ import (
 	"github.com/google/uuid"
 )
 
-type ChannelInfo_t struct {
+type ChannelInfo_t[T any] struct {
 	id uint32
-	C  chan interface{}
+	C  chan T
 }
 
-type notifyInfo_t struct {
+type notifyInfo_t[T any] struct {
 	t    notifyType_t
-	info ChannelInfo_t
+	info ChannelInfo_t[T]
 }
 
 type notifyType_t int
@@ -24,170 +24,153 @@ const (
 	release
 )
 
-type IntegratedChannel_t struct {
-	subInfo     []ChannelInfo_t
-	C           chan interface{}
-	notify      chan notifyInfo_t
-	response    chan interface{}
-	id          uint32
+type IntegratedChannel_t[T any] struct {
+	subInfo     map[uint32]ChannelInfo_t[T]
+	C           chan T
+	notify      chan notifyInfo_t[T]
+	response    chan error
 	channelSize int
 }
 
-type ChannelType int
-
-const (
-	ChannelBroadCast ChannelType = iota
-	ChannelCollect
-)
-
-func CreateIntegratedCh(size int, chType ChannelType) (*IntegratedChannel_t, error) {
+func CreateCollectedCh[T any](size int) (*IntegratedChannel_t[T], error) {
 	if size == 0 {
 		return nil, fmt.Errorf("Incorrect size\n")
 	}
 
-	c := &IntegratedChannel_t{
-		C:           make(chan interface{}, size),
-		subInfo:     []ChannelInfo_t{},
+	c := &IntegratedChannel_t[T]{
+		C:           make(chan T, size),
+		subInfo:     map[uint32]ChannelInfo_t[T]{},
 		channelSize: size,
-		id:          uuid.Must(uuid.NewRandom()).ID(),
-		notify:      make(chan notifyInfo_t),
-		response:    make(chan interface{}),
+		notify:      make(chan notifyInfo_t[T]),
+		response:    make(chan error),
 	}
 
-	switch chType {
-	case ChannelBroadCast:
-		go broadCast(c)
-		break
-	case ChannelCollect:
-		go collect(c)
-		break
-	}
+	go collect(c)
 
 	return c, nil
 }
 
-func DeleteIntegratedCh(in *IntegratedChannel_t) {
-	in.notify <- notifyInfo_t{
-		t:    release,
-		info: ChannelInfo_t{},
+func CreateBroadcastCh[T any](size int) (*IntegratedChannel_t[T], error) {
+	if size == 0 {
+		return nil, fmt.Errorf("Incorrect size\n")
 	}
-	<-in.response
-	close(in.response)
+
+	c := &IntegratedChannel_t[T]{
+		C:           make(chan T, size),
+		subInfo:     map[uint32]ChannelInfo_t[T]{},
+		channelSize: size,
+		notify:      make(chan notifyInfo_t[T]),
+		response:    make(chan error),
+	}
+
+	go broadCast(c)
+
+	return c, nil
 }
 
-func (in *IntegratedChannel_t) RegisterCh(c chan interface{}) ChannelInfo_t {
+func (in *IntegratedChannel_t[T]) ReleaseChannels() (err error) {
+	in.notify <- notifyInfo_t[T]{
+		t:    release,
+		info: ChannelInfo_t[T]{},
+	}
+
+	err = <-in.response
+	close(in.response)
+	return
+}
+
+func (in *IntegratedChannel_t[T]) RegisterCh(c chan T) (ChannelInfo_t[T], error) {
 	id := uuid.Must(uuid.NewRandom())
-	info := ChannelInfo_t{
+	info := ChannelInfo_t[T]{
 		id: id.ID(),
 		C:  c,
 	}
 
-	in.notify <- notifyInfo_t{
+	in.notify <- notifyInfo_t[T]{
 		t:    add,
 		info: info,
 	}
-	<-in.response
-	return info
+
+	return info, <-in.response
 }
 
-func (in *IntegratedChannel_t) GetCh() ChannelInfo_t {
-	id := uuid.Must(uuid.NewRandom())
-	info := ChannelInfo_t{
-		id: id.ID(),
-		C:  make(chan interface{}, in.channelSize),
-	}
-
-	in.notify <- notifyInfo_t{
-		t:    add,
-		info: info,
-	}
-	<-in.response
-	return info
-}
-
-func (in *IntegratedChannel_t) RemoveCh(info ChannelInfo_t) {
-	in.notify <- notifyInfo_t{
+func (in *IntegratedChannel_t[T]) RemoveCh(info ChannelInfo_t[T]) error {
+	in.notify <- notifyInfo_t[T]{
 		t:    remove,
 		info: info,
 	}
 
-	<-in.response
-	return
+	return <-in.response
 }
 
-func broadCast(in *IntegratedChannel_t) {
+func broadCast[T any](in *IntegratedChannel_t[T]) {
 	for {
 		select {
 		case d := <-in.C:
 			for _, c := range in.subInfo {
 				c.C <- d
 			}
-		case d := <-in.notify:
+		case d, ok := <-in.notify:
+			if !ok {
+				in.response <- fmt.Errorf("Notify ch invalid")
+				return
+			}
 			switch d.t {
 			case add:
-				in.subInfo = append(in.subInfo, d.info)
+				in.subInfo[d.info.id] = d.info
 			case remove:
-				for i, v := range in.subInfo {
-					if v.id == d.info.id {
-						close(v.C)
-						in.subInfo = append(in.subInfo[:i], in.subInfo[i+1:]...)
-						break
-					}
-				}
+				close(in.subInfo[d.info.id].C)
+				delete(in.subInfo, d.info.id)
 			case release:
 				for _, v := range in.subInfo {
 					close(v.C)
 				}
 				close(in.C)
 				close(in.notify)
-				in.response <- "done"
+				in.response <- nil
 				return
 			}
-			in.response <- "done"
+			in.response <- nil
 		}
 	}
 }
 
-func collect(in *IntegratedChannel_t) {
+func collect[T any](in *IntegratedChannel_t[T]) {
 	for {
 		select {
 		case d, ok := <-in.notify:
 			if !ok {
+				in.response <- fmt.Errorf("Notify ch invalid")
 				return
 			}
 			switch d.t {
 			case add:
-				in.subInfo = append(in.subInfo, d.info)
-				go func(c chan interface{}) {
+				in.subInfo[d.info.id] = d.info
+				go func(c chan T) {
 					for {
 						select {
 						case d, ok := <-c:
-							if !ok {
+							if ok {
+								in.C <- d
+							} else {
 								return
 							}
-							in.C <- d
 						}
 					}
 				}(d.info.C)
 			case remove:
-				for i, v := range in.subInfo {
-					if v.id == d.info.id {
-						close(v.C)
-						in.subInfo = append(in.subInfo[:i], in.subInfo[i+1:]...)
-						break
-					}
-				}
+				close(in.subInfo[d.info.id].C)
+				delete(in.subInfo, d.info.id)
 			case release:
-				fmt.Println("Release")
 				for _, v := range in.subInfo {
 					close(v.C)
 				}
 				close(in.C)
 				close(in.notify)
-				in.response <- "done"
+				in.response <- nil
 				return
 			}
-			in.response <- "done"
+			in.response <- nil
 		}
 	}
 }
