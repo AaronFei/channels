@@ -119,12 +119,8 @@ func broadCast[T any](in *IntegratedChannel_t[T]) {
 			case add:
 				in.subInfo[d.info.id] = d.info
 			case remove:
-				close(in.subInfo[d.info.id].C)
 				delete(in.subInfo, d.info.id)
 			case release:
-				for _, v := range in.subInfo {
-					close(v.C)
-				}
 				close(in.C)
 				close(in.notify)
 				in.response <- nil
@@ -159,12 +155,8 @@ func collect[T any](in *IntegratedChannel_t[T]) {
 					}
 				}(d.info.C)
 			case remove:
-				close(in.subInfo[d.info.id].C)
 				delete(in.subInfo, d.info.id)
 			case release:
-				for _, v := range in.subInfo {
-					close(v.C)
-				}
 				close(in.C)
 				close(in.notify)
 				in.response <- nil
